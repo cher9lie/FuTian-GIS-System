@@ -399,3 +399,19 @@ FodyWeavers.xsd
 
 # JetBrains Rider
 *.sln.iml
+
+# ------------------------------------------------
+# ArcGIS Engine / ArcObjects Specific Ignores
+# 忽略AE生成的垃圾文件
+*.aoi
+
+# ------------------------------------------------
+# GIS DATA - DO NOT COMMIT!
+# 绝对禁止提交GDB和MDB数据库！
+*.gdb/
+*.mdb
+*.shp
+*.shx
+*.dbf
+*.prj
+# (我们只提交代码，不提交数据)
