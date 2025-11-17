@@ -1,6 +1,4 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.Linq;
 using System.Windows.Forms;
 using ESRI.ArcGIS;
 using ESRI.ArcGIS.esriSystem;
@@ -18,11 +16,30 @@ namespace FuTianGIS
         [STAThread]
         static void Main()
         {
-            // 步骤 1: 初始化 ArcGIS 许可
+            // 第 0 步：绑定 ArcGIS 产品类型
+            if (!RuntimeManager.Bind(ProductCode.Engine))
+            {
+                // 如果绑定 Engine 失败，尝试 Desktop
+                if (!RuntimeManager.Bind(ProductCode.Desktop))
+                {
+                    MessageBox.Show(
+                        "无法绑定到 ArcGIS Engine 或 Desktop 运行环境！\n" +
+                        "请检查是否已正确安装 ArcGIS Engine Runtime 或 ArcGIS Desktop。",
+                        "绑定错误",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Error
+                    );
+                    return;
+                }
+            }
+
+            // 第 1 步：初始化 ArcGIS 许可
             if (!InitializeLicense())
             {
                 MessageBox.Show(
-                    "无法获取 ArcGIS Engine 许可！\n\n请确保：\n1. 已安装 ArcGIS Engine 10.x\n2. 许可管理器中有有效的 Engine 许可",
+                    "无法获取 ArcGIS 许可！\n\n请确保：\n" +
+                    "1. 已安装 ArcGIS Engine Runtime 或 ArcGIS Desktop 10.x\n" +
+                    "2. 许可管理器中有有效的许可（Engine 或 Desktop）",
                     "许可错误",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error
@@ -30,12 +47,22 @@ namespace FuTianGIS
                 return; // 退出程序
             }
 
-            // 步骤 2: 启动 Windows 窗体应用程序
+            // 第 2 步：启动 Windows 窗体应用程序
             try
             {
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
-                Application.Run(new MainForm()); // 这里要与你的窗体类名一致
+
+                // 先显示登录窗体
+                LoginForm loginForm = new LoginForm();
+                if (loginForm.ShowDialog() == DialogResult.OK)
+                {
+                    Application.Run(new MainForm());
+                }
+                else
+                {
+                    return;
+                }
             }
             catch (Exception ex)
             {
@@ -48,7 +75,7 @@ namespace FuTianGIS
             }
             finally
             {
-                // 步骤 3: 关闭许可（无论程序如何退出都会执行）
+                // 第 3 步：关闭许可
                 ShutdownLicense();
             }
         }
@@ -60,11 +87,9 @@ namespace FuTianGIS
         {
             try
             {
-                // 尝试初始化 Engine 许可
-                // 优先级顺序：Engine -> ArcView -> ArcEditor -> ArcInfo
                 esriLicenseStatus status = m_AOLicenseInitializer.InitializeApplication(
-                    new esriLicenseProductCode[] 
-                    { 
+                    new esriLicenseProductCode[]
+                    {
                         esriLicenseProductCode.esriLicenseProductCodeEngine,
                         esriLicenseProductCode.esriLicenseProductCodeBasic,
                         esriLicenseProductCode.esriLicenseProductCodeStandard,
@@ -125,17 +150,17 @@ namespace FuTianGIS
             m_AoInitialize = new AoInitializeClass();
             esriLicenseStatus licenseStatus = esriLicenseStatus.esriLicenseUnavailable;
 
-            // 尝试按优先级顺序初始化许可
+            // 按优先级顺序初始化许可
             foreach (esriLicenseProductCode productCode in productCodes)
             {
                 licenseStatus = m_AoInitialize.Initialize(productCode);
                 if (licenseStatus == esriLicenseStatus.esriLicenseCheckedOut)
                 {
-                    break; // 成功获取许可，跳出循环
+                    break;
                 }
             }
 
-            // 可选：检出扩展模块许可（如 Spatial Analyst）
+            // 可选：检出扩展模块许可
             foreach (esriLicenseExtensionCode extensionCode in extensionCodes)
             {
                 m_AoInitialize.CheckOutExtension(extensionCode);
