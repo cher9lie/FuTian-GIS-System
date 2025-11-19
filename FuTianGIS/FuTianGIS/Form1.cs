@@ -19,11 +19,26 @@ using ESRI.ArcGIS.DataSourcesGDB;
 using ESRI.ArcGIS.Geometry;
 using ESRI.ArcGIS.esriSystem;
 using ESRI.ArcGIS.Output;
+using ESRI.ArcGIS.NetworkAnalystTools;
+using ESRI.ArcGIS.NetworkAnalyst;
+using ESRI.ArcGIS.Geoprocessing;
+using ESRI.ArcGIS.GeoDatabaseExtensions;
 
 namespace FuTianGIS
 {
     public partial class MainForm : Form
     {
+        // ====== 路径分析相关字段 ======
+        private INAContext _naContext;              // Network Analyst 上下文
+        private bool _routeStartSet = false;        // 是否已经设置起点
+        private IPoint _routeStartPoint;            // 起点坐标（用户第一次点击）
+        private IPoint _routeEndPoint;              // 终点坐标（用户第二次点击）
+        private IElement _routeStartElement;        // 地图上显示起点的图形元素
+        private IElement _routeEndElement;          // 地图上显示终点的图形元素
+        private IElement _routePathElement;         // 地图上显示路径的线要素
+        private bool _isSettingRoutePoints = false; // 是否处在“设置起终点模式”
+        // 是否处于“新增点”模式
+        private bool _isAddingPoint = false;
         // 最近一次生成的缓冲几何，供功能 10 复用
         private IGeometry _lastBufferGeometry;
         // ... 你已有的字段 ...
@@ -385,6 +400,231 @@ namespace FuTianGIS
         {
             try
             {
+                // 0. 路径分析：设置起点/终点模式优先
+                if (_isSettingRoutePoints)
+                {
+                    if (e.button != 1)
+                        return;
+
+                    IPoint clickPoint = axMapControl1.ActiveView.ScreenDisplay.DisplayTransformation.ToMapPoint(e.x, e.y);
+
+                    IMap map = axMapControl1.Map;
+                    IGraphicsContainer gc = map as IGraphicsContainer;
+                    IActiveView av = map as IActiveView;
+
+                    if (!_routeStartSet)
+                    {
+                        // 设置起点
+                        _routeStartPoint = clickPoint;
+                        _routeStartSet = true;
+
+                        // 画一个绿色圆点作为起点
+                        IRgbColor color = new RgbColorClass();
+                        color.Red = 0; color.Green = 255; color.Blue = 0;
+
+                        ISimpleMarkerSymbol sms = new SimpleMarkerSymbolClass();
+                        sms.Style = esriSimpleMarkerStyle.esriSMSCircle;
+                        sms.Size = 10;
+                        sms.Color = color;
+
+                        IMarkerElement me = new MarkerElementClass();
+                        me.Symbol = sms;
+
+                        _routeStartElement = me as IElement;
+                        _routeStartElement.Geometry = _routeStartPoint;
+
+                        if (gc != null)
+                        {
+                            gc.AddElement(_routeStartElement, 0);
+                            if (av != null)
+                                av.PartialRefresh(esriViewDrawPhase.esriViewGraphics, null, null);
+                        }
+
+                        MessageBox.Show("起点已设置，请点击终点。", "路径分析",
+                            MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    }
+                    else
+                    {
+                        // 设置终点
+                        _routeEndPoint = clickPoint;
+                        _isSettingRoutePoints = false; // 结束设置模式
+
+                        // 画一个红色圆点作为终点
+                        IRgbColor color = new RgbColorClass();
+                        color.Red = 255; color.Green = 0; color.Blue = 0;
+
+                        ISimpleMarkerSymbol sms = new SimpleMarkerSymbolClass();
+                        sms.Style = esriSimpleMarkerStyle.esriSMSCircle;
+                        sms.Size = 10;
+                        sms.Color = color;
+
+                        IMarkerElement me = new MarkerElementClass();
+                        me.Symbol = sms;
+
+                        _routeEndElement = me as IElement;
+                        _routeEndElement.Geometry = _routeEndPoint;
+
+                        if (gc != null)
+                        {
+                            gc.AddElement(_routeEndElement, 0);
+                            if (av != null)
+                                av.PartialRefresh(esriViewDrawPhase.esriViewGraphics, null, null);
+                        }
+
+                        // 起终点都有了，开始求最短路径
+                        SolveRoute();
+                    }
+
+                    return; // 在路径模式下不再执行后面的新增点/识别逻辑
+                }
+                // 处理“新增点模式”
+                if (_isAddingPoint)
+                {
+                    if (e.button != 1)
+                        return;
+
+                    // 使用当前图层作为新增目标图层
+                    IFeatureLayer layer = GetCurrentFeatureLayer();
+                    if (layer == null || layer.FeatureClass == null)
+                    {
+                        MessageBox.Show("当前没有可用的要素图层，无法新增点。", "新增点",
+                            MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        _isAddingPoint = false;
+                        return;
+                    }
+
+                    IFeatureClass fc = layer.FeatureClass;
+                    if (fc.ShapeType != esriGeometryType.esriGeometryPoint &&
+                        fc.ShapeType != esriGeometryType.esriGeometryMultipoint)
+                    {
+                        MessageBox.Show("当前图层不是点图层，无法新增点。", "新增点",
+                            MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        _isAddingPoint = false;
+                        return;
+                    }
+
+                    // 1. 屏幕坐标转地图坐标
+                    IPoint mapPoint = axMapControl1.ActiveView.ScreenDisplay.DisplayTransformation.ToMapPoint(e.x, e.y);
+
+                    // 2. 启动编辑会话
+                    IDataset ds = fc as IDataset;
+                    if (ds == null || ds.Workspace == null)
+                    {
+                        MessageBox.Show("无法获取要素类所在的工作空间，不能编辑。", "新增点",
+                            MessageBoxButtons.OK, MessageBoxIcon.Error);
+                        _isAddingPoint = false;
+                        return;
+                    }
+
+                    IWorkspace workspace = ds.Workspace;
+                    IWorkspaceEdit workspaceEdit = workspace as IWorkspaceEdit;
+                    if (workspaceEdit == null)
+                    {
+                        MessageBox.Show("该数据源不支持编辑（可能是只读或非可编辑类型）。", "新增点",
+                            MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        _isAddingPoint = false;
+                        return;
+                    }
+
+                    bool startedHere = false;
+                    if (!workspaceEdit.IsBeingEdited())
+                    {
+                        workspaceEdit.StartEditing(false);
+                        workspaceEdit.StartEditOperation();
+                        startedHere = true;
+                    }
+                    else
+                    {
+                        workspaceEdit.StartEditOperation();
+                    }
+
+                    // 3. 创建新要素并设置几何
+                    IFeature newFeature = fc.CreateFeature();
+                    newFeature.Shape = mapPoint;
+
+                    // 4. 弹出多字段编辑窗体，让用户填写属性
+                    using (FeatureAttributeEditForm attrForm = new FeatureAttributeEditForm(fc.Fields))
+                    {
+                        if (attrForm.ShowDialog(this) == DialogResult.OK)
+                        {
+                            foreach (var item in attrForm.EditedItems)
+                            {
+                                int idx = fc.FindField(item.FieldName);
+                                if (idx < 0) continue;
+
+                                IField f = fc.Fields.get_Field(idx);
+                                string txt = item.Value;
+
+                                if (string.IsNullOrEmpty(txt))
+                                {
+                                    // 留空就不赋值或给 NULL
+                                    continue;
+                                }
+
+                                object valObj = null;
+
+                                switch (f.Type)
+                                {
+                                    case esriFieldType.esriFieldTypeString:
+                                        valObj = txt;
+                                        break;
+                                    case esriFieldType.esriFieldTypeInteger:
+                                    case esriFieldType.esriFieldTypeSmallInteger:
+                                        int intVal;
+                                        if (int.TryParse(txt, out intVal))
+                                            valObj = intVal;
+                                        break;
+                                    case esriFieldType.esriFieldTypeDouble:
+                                    case esriFieldType.esriFieldTypeSingle:
+                                        double dblVal;
+                                        if (double.TryParse(txt, out dblVal))
+                                            valObj = dblVal;
+                                        break;
+                                    case esriFieldType.esriFieldTypeDate:
+                                        DateTime dtVal;
+                                        if (DateTime.TryParse(txt, out dtVal))
+                                            valObj = dtVal;
+                                        break;
+                                    default:
+                                        break;
+                                }
+
+                                if (valObj != null)
+                                {
+                                    newFeature.set_Value(idx, valObj);
+                                }
+                            }
+
+                            // 5. 保存要素
+                            newFeature.Store();
+
+                            workspaceEdit.StopEditOperation();
+                            if (startedHere)
+                            {
+                                workspaceEdit.StopEditing(true);
+                            }
+
+                            axMapControl1.ActiveView.PartialRefresh(esriViewDrawPhase.esriViewGeography, null, null);
+
+                            MessageBox.Show("已成功新增一个点要素。", "新增点",
+                                MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        }
+                        else
+                        {
+                            // 用户取消输入，撤销本次编辑
+                            workspaceEdit.AbortEditOperation();
+                            if (startedHere)
+                            {
+                                workspaceEdit.StopEditing(false); // 不保存
+                            }
+                        }
+                    }
+
+                    // 一次点击完成后退出新增模式（如需连续新增，可以不退出）
+                    _isAddingPoint = false;
+
+                    return;
+                }
                 // 如果当前正在用 Toolbar 上的工具，则不打扰（比如正在放大、平移）
                 if (axToolbarControl1.CurrentTool != null)
                     return;
@@ -398,15 +638,15 @@ namespace FuTianGIS
                 int y = e.y;
 
                 // 将屏幕坐标转换为地图坐标
-                IPoint mapPoint = axMapControl1.ActiveView.ScreenDisplay.DisplayTransformation.ToMapPoint(x, y);
+                IPoint mapPoint2 = axMapControl1.ActiveView.ScreenDisplay.DisplayTransformation.ToMapPoint(x, y);
 
                 // 找到最上面的可见 FeatureLayer
-                IMap map = axMapControl1.Map;
+                IMap routemap = axMapControl1.Map;
                 IFeatureLayer topFeatureLayer = null;
 
-                for (int iLayer = 0; iLayer < map.LayerCount; iLayer++)
+                for (int iLayer = 0; iLayer < routemap.LayerCount; iLayer++)
                 {
-                    ILayer layer = map.get_Layer(iLayer);
+                    ILayer layer = routemap.get_Layer(iLayer);
                     if (layer is IFeatureLayer && layer.Visible)
                     {
                         topFeatureLayer = (IFeatureLayer)layer;
@@ -430,7 +670,7 @@ namespace FuTianGIS
                     return;
                 }
 
-                IArray idResultArray = identify.Identify(mapPoint);
+                IArray idResultArray = identify.Identify(mapPoint2);
                 if (idResultArray == null || idResultArray.Count == 0)
                 {
                     MessageBox.Show("点击位置没有找到要素。", "提示",
@@ -882,6 +1122,182 @@ namespace FuTianGIS
             }
 
         }
+        /// <summary>
+        /// 简单字符串输入对话框，用于让用户输入属性新值等
+        /// </summary>
+        internal class InputTextForm : Form
+        {
+            private TextBox txtValue;
+            private Button btnOk;
+            private Button btnCancel;
+
+            public string InputText
+            {
+                get { return txtValue.Text; }
+            }
+
+            public InputTextForm(string title, string labelText, string defaultValue = "")
+            {
+                this.Text = title;
+                this.StartPosition = FormStartPosition.CenterParent;
+                this.FormBorderStyle = FormBorderStyle.FixedDialog;
+                this.MaximizeBox = false;
+                this.MinimizeBox = false;
+                this.Width = 360;
+                this.Height = 160;
+
+                Label lbl = new Label();
+                lbl.Text = labelText;
+                lbl.Left = 15;
+                lbl.Top = 15;
+                lbl.AutoSize = true;
+
+                txtValue = new TextBox();
+                txtValue.Left = 15;
+                txtValue.Top = 40;
+                txtValue.Width = 320;
+                txtValue.Text = defaultValue;
+
+                btnOk = new Button();
+                btnOk.Text = "确定";
+                btnOk.DialogResult = DialogResult.OK;
+                btnOk.Left = 80;
+                btnOk.Top = 80;
+                btnOk.Width = 80;
+
+                btnCancel = new Button();
+                btnCancel.Text = "取消";
+                btnCancel.DialogResult = DialogResult.Cancel;
+                btnCancel.Left = 180;
+                btnCancel.Top = 80;
+                btnCancel.Width = 80;
+
+                this.AcceptButton = btnOk;
+                this.CancelButton = btnCancel;
+
+                this.Controls.Add(lbl);
+                this.Controls.Add(txtValue);
+                this.Controls.Add(btnOk);
+                this.Controls.Add(btnCancel);
+            }
+        }
+        /// <summary>
+        /// 多字段属性编辑窗口：列出可编辑字段，让用户逐个填写值
+        /// </summary>
+        internal class FeatureAttributeEditForm : Form
+        {
+            private DataGridView dgv;
+            private Button btnOk;
+            private Button btnCancel;
+
+            public class FieldEditItem
+            {
+                public string FieldName { get; set; }
+                public string FieldAlias { get; set; }
+                public string FieldType { get; set; }
+                public string Value { get; set; }
+            }
+
+            private BindingList<FieldEditItem> _items;
+
+            public IEnumerable<FieldEditItem> EditedItems
+            {
+                get { return _items; }
+            }
+
+            public FeatureAttributeEditForm(IFields fields)
+            {
+                this.Text = "编辑属性";
+                this.StartPosition = FormStartPosition.CenterParent;
+                this.FormBorderStyle = FormBorderStyle.FixedDialog;
+                this.MaximizeBox = false;
+                this.MinimizeBox = false;
+                this.Width = 500;
+                this.Height = 400;
+
+                dgv = new DataGridView();
+                dgv.Dock = DockStyle.Top;
+                dgv.Height = 300;
+                dgv.AutoGenerateColumns = false;
+                dgv.AllowUserToAddRows = false;
+                dgv.AllowUserToDeleteRows = false;
+
+                // 列：字段名（只读）、别名（只读）、类型（只读）、值（可编辑）
+                DataGridViewTextBoxColumn colName = new DataGridViewTextBoxColumn();
+                colName.HeaderText = "字段名";
+                colName.DataPropertyName = "FieldName";
+                colName.ReadOnly = true;
+                colName.Width = 120;
+
+                DataGridViewTextBoxColumn colAlias = new DataGridViewTextBoxColumn();
+                colAlias.HeaderText = "别名";
+                colAlias.DataPropertyName = "FieldAlias";
+                colAlias.ReadOnly = true;
+                colAlias.Width = 150;
+
+                DataGridViewTextBoxColumn colType = new DataGridViewTextBoxColumn();
+                colType.HeaderText = "类型";
+                colType.DataPropertyName = "FieldType";
+                colType.ReadOnly = true;
+                colType.Width = 80;
+
+                DataGridViewTextBoxColumn colValue = new DataGridViewTextBoxColumn();
+                colValue.HeaderText = "值";
+                colValue.DataPropertyName = "Value";
+                colValue.ReadOnly = false;
+                colValue.Width = 120;
+
+                dgv.Columns.Add(colName);
+                dgv.Columns.Add(colAlias);
+                dgv.Columns.Add(colType);
+                dgv.Columns.Add(colValue);
+
+                btnOk = new Button();
+                btnOk.Text = "确定";
+                btnOk.DialogResult = DialogResult.OK;
+                btnOk.Left = 150;
+                btnOk.Top = 320;
+                btnOk.Width = 80;
+
+                btnCancel = new Button();
+                btnCancel.Text = "取消";
+                btnCancel.DialogResult = DialogResult.Cancel;
+                btnCancel.Left = 260;
+                btnCancel.Top = 320;
+                btnCancel.Width = 80;
+
+                this.AcceptButton = btnOk;
+                this.CancelButton = btnCancel;
+
+                this.Controls.Add(dgv);
+                this.Controls.Add(btnOk);
+                this.Controls.Add(btnCancel);
+
+                // 初始化字段列表：只列出可编辑、非几何、非OID字段
+                _items = new BindingList<FieldEditItem>();
+
+                for (int i = 0; i < fields.FieldCount; i++)
+                {
+                    IField f = fields.get_Field(i);
+
+                    if (!f.Editable) continue;
+                    if (f.Type == esriFieldType.esriFieldTypeGeometry ||
+                        f.Type == esriFieldType.esriFieldTypeOID)
+                        continue;
+
+                    FieldEditItem item = new FieldEditItem();
+                    item.FieldName = f.Name;
+                    item.FieldAlias = f.AliasName;
+                    item.FieldType = f.Type.ToString();
+                    item.Value = ""; // 默认空，由用户填写
+
+                    _items.Add(item);
+                }
+
+                dgv.DataSource = _items;
+            }
+        }
+
 
         private void btnBuffer_Click(object sender, EventArgs e)
 {
@@ -1219,6 +1635,554 @@ namespace FuTianGIS
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error);
             }
+        }
+
+        private void btnEdit_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                // 1. 获取当前图层和选中要素
+                IFeatureLayer layer = GetCurrentFeatureLayer();
+                if (layer == null || layer.FeatureClass == null)
+                {
+                    MessageBox.Show("当前没有可用的要素图层。", "属性编辑",
+                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                IFeatureSelection featSel = layer as IFeatureSelection;
+                if (featSel == null || featSel.SelectionSet == null || featSel.SelectionSet.Count == 0)
+                {
+                    MessageBox.Show("请先在地图上选择至少一个要素。", "属性编辑",
+                        MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+
+                IFeatureClass fc = layer.FeatureClass;
+                IFields fields = fc.Fields;
+
+                // 2. 让用户选择要修改的字段（排除几何字段、OID 等）
+                List<string> editableFields = new List<string>();
+                for (int i = 0; i < fields.FieldCount; i++)
+                {
+                    IField f = fields.get_Field(i);
+
+                    // 排除几何、OID、只读字段等（这里只做简单判断）
+                    if (f.Type == esriFieldType.esriFieldTypeGeometry ||
+                        f.Type == esriFieldType.esriFieldTypeOID)
+                        continue;
+
+                    if (f.Editable)
+                        editableFields.Add(f.Name);
+                }
+
+                if (editableFields.Count == 0)
+                {
+                    MessageBox.Show("当前图层中没有可编辑的属性字段。", "属性编辑",
+                        MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+
+                string fieldName = null;
+                using (FieldSelectForm dlgField = new FieldSelectForm(editableFields))
+                {
+                    dlgField.Text = "选择要修改的字段";
+                    if (dlgField.ShowDialog(this) != DialogResult.OK)
+                        return;
+
+                    fieldName = dlgField.SelectedFieldName;
+                }
+
+                if (string.IsNullOrEmpty(fieldName))
+                    return;
+
+                int fieldIndex = fc.FindField(fieldName);
+                if (fieldIndex < 0)
+                {
+                    MessageBox.Show("无法在要素类中找到字段 \"" + fieldName + "\"。", "属性编辑",
+                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                IField targetField = fields.get_Field(fieldIndex);
+
+                // 3. 让用户输入新的属性值（以字符串形式）
+                string newValueStr = null;
+                using (InputTextForm dlgInput = new InputTextForm(
+                    "输入新属性值",
+                    "请输入字段 \"" + fieldName + "\" 的新值：",
+                    "已整改"))
+                {
+                    if (dlgInput.ShowDialog(this) != DialogResult.OK)
+                        return;
+
+                    newValueStr = dlgInput.InputText;
+                }
+
+                if (newValueStr == null)
+                    return;
+
+                // 4. 启动编辑会话
+                IDataset ds = fc as IDataset;
+                if (ds == null || ds.Workspace == null)
+                {
+                    MessageBox.Show("无法获取要素类所在的工作空间，不能编辑。", "属性编辑",
+                        MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
+
+                IWorkspace workspace = ds.Workspace;
+                IWorkspaceEdit workspaceEdit = workspace as IWorkspaceEdit;
+                if (workspaceEdit == null)
+                {
+                    MessageBox.Show("该数据源不支持编辑（可能是只读或非可编辑类型）。", "属性编辑",
+                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                bool startedHere = false;
+                if (!workspaceEdit.IsBeingEdited())
+                {
+                    workspaceEdit.StartEditing(false);
+                    workspaceEdit.StartEditOperation();
+                    startedHere = true;
+                }
+                else
+                {
+                    workspaceEdit.StartEditOperation();
+                }
+
+                // 5. 遍历选中要素，按字段类型把字符串转换成合适类型后写入
+                ISelectionSet selSet = featSel.SelectionSet;
+                ICursor cursor;
+                selSet.Search(null, false, out cursor);
+                IFeatureCursor fCursor = cursor as IFeatureCursor;
+                IFeature feature = fCursor.NextFeature();
+
+                int editedCount = 0;
+
+                while (feature != null)
+                {
+                    object newValObj = null;
+
+                    switch (targetField.Type)
+                    {
+                        case esriFieldType.esriFieldTypeString:
+                            newValObj = newValueStr;
+                            break;
+                        case esriFieldType.esriFieldTypeInteger:
+                        case esriFieldType.esriFieldTypeSmallInteger:
+                            int intVal;
+                            if (int.TryParse(newValueStr, out intVal))
+                                newValObj = intVal;
+                            else
+                            {
+                                // 如果解析失败，就不修改这个要素
+                                feature = fCursor.NextFeature();
+                                continue;
+                            }
+                            break;
+                        case esriFieldType.esriFieldTypeDouble:
+                        case esriFieldType.esriFieldTypeSingle:
+                            double dblVal;
+                            if (double.TryParse(newValueStr, out dblVal))
+                                newValObj = dblVal;
+                            else
+                            {
+                                feature = fCursor.NextFeature();
+                                continue;
+                            }
+                            break;
+                        case esriFieldType.esriFieldTypeDate:
+                            DateTime dtVal;
+                            if (DateTime.TryParse(newValueStr, out dtVal))
+                                newValObj = dtVal;
+                            else
+                            {
+                                feature = fCursor.NextFeature();
+                                continue;
+                            }
+                            break;
+                        default:
+                            // 其他类型暂不支持，跳过
+                            feature = fCursor.NextFeature();
+                            continue;
+                    }
+
+                    feature.set_Value(fieldIndex, newValObj);
+                    feature.Store();
+                    editedCount++;
+
+                    feature = fCursor.NextFeature();
+                }
+
+                workspaceEdit.StopEditOperation();
+                if (startedHere)
+                {
+                    workspaceEdit.StopEditing(true);
+                }
+
+                IActiveView activeView = axMapControl1.ActiveView;
+                activeView.PartialRefresh(esriViewDrawPhase.esriViewGeography, null, null);
+                activeView.PartialRefresh(esriViewDrawPhase.esriViewGeoSelection, null, null);
+
+                MessageBox.Show(
+                    string.Format("已将 {0} 个要素的 \"{1}\" 字段修改为 \"{2}\"。", editedCount, fieldName, newValueStr),
+                    "属性编辑",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("属性编辑时发生错误：\n" + ex.Message,
+                    "属性编辑错误",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
+        }
+
+        private void btnAddPoint_Click(object sender, EventArgs e)
+        {
+            IFeatureLayer layer = GetCurrentFeatureLayer();
+            if (layer == null || layer.FeatureClass == null)
+            {
+                MessageBox.Show("当前没有可用的要素图层。请在图层目录中选择要新增点的图层。", "新增点",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            // 检查图层是否为点图层
+            IFeatureClass fc = layer.FeatureClass;
+            if (fc.ShapeType != esriGeometryType.esriGeometryPoint &&
+                fc.ShapeType != esriGeometryType.esriGeometryMultipoint)
+            {
+                MessageBox.Show("当前选中的图层不是点图层，无法新增点要素。", "新增点",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            // 标记进入新增模式
+            _isAddingPoint = true;
+
+            MessageBox.Show("请在地图上单击位置来创建一个新点要素。", "新增点",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        /// <summary>
+        /// 初始化 Network Analyst 上下文：从 FileGDB 中打开 Network Dataset，并创建 INAContext
+        /// </summary>
+        private bool InitNetworkAnalysis()
+        {
+            try
+            {
+                if (_naContext != null)
+                    return true; // 已经初始化过
+
+                // TODO: 这里请填上你的 .gdb 完整路径
+                // 例如：C:\\Data\\FutianNetwork.gdb
+                string gdbPath = @"C:\YourPath\YourGdb.gdb";
+
+                // 要素数据集名称和 ND 名称，按你提供的配置
+                string featureDatasetName = "Network_Container";
+                string ndName = "Roads_Car_Clean_ND";
+
+                // 1. 打开 File GDB 工作空间
+                IWorkspaceFactory wsFactory = new FileGDBWorkspaceFactoryClass();
+                IFeatureWorkspace fws = wsFactory.OpenFromFile(gdbPath, 0) as IFeatureWorkspace;
+                if (fws == null)
+                {
+                    MessageBox.Show("无法打开 File GDB：" + gdbPath, "路径分析",
+                        MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return false;
+                }
+
+                // 2. 获取要素数据集
+                IFeatureDataset fd = fws.OpenFeatureDataset(featureDatasetName);
+                if (fd == null)
+                {
+                    MessageBox.Show("在 GDB 中未找到要素数据集：" + featureDatasetName, "路径分析",
+                        MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return false;
+                }
+
+                // 3. 从 Feature Dataset 中找到 Network Dataset
+                //    Network Dataset 是 IDatasetContainer3 的一部分
+                IDatasetContainer3 dsContainer = fd as IDatasetContainer3;
+                if (dsContainer == null)
+                {
+                    MessageBox.Show("要素数据集不支持 Network Dataset 容器接口。", "路径分析",
+                        MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return false;
+                }
+
+                IDataset nds = dsContainer.get_DatasetByName(esriDatasetType.esriDTNetworkDataset, ndName);
+                if (nds == null)
+                {
+                    MessageBox.Show("未在要素数据集中找到网络数据集：" + ndName, "路径分析",
+                        MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return false;
+                }
+
+                INetworkDataset networkDataset = nds as INetworkDataset;
+                if (networkDataset == null)
+                {
+                    MessageBox.Show("获取到的对象不是 Network Dataset。", "路径分析",
+                        MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return false;
+                }
+
+                // 4. 创建 NAContext
+                IDENetworkDataset deNetworkDataset = GetDENetworkDatasetFromNetworkDataset(networkDataset);
+                if (deNetworkDataset == null)
+                {
+                    MessageBox.Show("无法从 Network Dataset 获取 DENetworkDataset。", "路径分析",
+                        MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return false;
+                }
+
+                INASolver naSolver = new NARouteSolverClass();
+                INAContextEdit naContextEdit = naSolver.CreateContext(deNetworkDataset, naSolver.Name) as INAContextEdit;
+                naContextEdit.Bind(networkDataset, new GPMessagesClass());
+                _naContext = naContextEdit as INAContext;
+
+                // 5. 设置默认的成本字段和限制
+                INASolverSettings solverSettings = naSolver as INASolverSettings;
+                if (solverSettings != null)
+                {
+                    // 成本属性名称：Minutes
+                    solverSettings.ImpedanceAttributeName = "Minutes";
+
+                    // 启用 Oneway 限制
+                    IStringArray restrictions = solverSettings.RestrictionAttributeNames;
+                    if (restrictions == null)
+                        restrictions = new StrArrayClass();
+                    restrictions.Add("Oneway");
+                    solverSettings.RestrictionAttributeNames = restrictions;
+                }
+
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("初始化路径分析时发生错误：\n" + ex.Message,
+                    "路径分析错误",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return false;
+            }
+        }
+
+        private void SolveRoute()
+        {
+            try
+            {
+                if (_naContext == null)
+                {
+                    MessageBox.Show("网络分析上下文尚未初始化。", "路径分析",
+                        MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
+                if (_routeStartPoint == null || _routeEndPoint == null)
+                {
+                    MessageBox.Show("起点或终点未设置。", "路径分析",
+                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                // 1. 获取 Stops 和 Routes NAClass
+                INAClass stopsNAClass = _naContext.NAClasses.get_ItemByName("Stops") as INAClass;
+                INAClass routesNAClass = _naContext.NAClasses.get_ItemByName("Routes") as INAClass;
+                if (stopsNAClass == null || routesNAClass == null)
+                {
+                    MessageBox.Show("在 NAContext 中未找到 Stops 或 Routes 类，请检查网络数据集配置。", "路径分析",
+                        MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
+
+                // 2. 通过 ITable 接口清空上一次求解结果
+                ITable stopsTable = stopsNAClass as ITable;
+                ITable routesTable = routesNAClass as ITable;
+                if (stopsTable == null || routesTable == null)
+                {
+                    MessageBox.Show("NAClass 未能转换为 ITable 接口。", "路径分析",
+                        MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
+
+                // 清空全部行
+                ICursor delCursor = stopsTable.Search(null, false);
+                IRow row = delCursor.NextRow();
+                while (row != null)
+                {
+                    row.Delete();
+                    row = delCursor.NextRow();
+                }
+
+                delCursor = routesTable.Search(null, false);
+                row = delCursor.NextRow();
+                while (row != null)
+                {
+                    row.Delete();
+                    row = delCursor.NextRow();
+                }
+
+                // 3. 向 Stops 表中添加起点和终点（通过 IRow）
+                int stopsShapeIndex = stopsTable.FindField("Shape");
+                if (stopsShapeIndex < 0)
+                {
+                    MessageBox.Show("Stops 表中未找到 Shape 字段。", "路径分析",
+                        MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
+
+                // 起点
+                IRow fromRow = stopsTable.CreateRow();
+                fromRow.set_Value(stopsShapeIndex, _routeStartPoint);
+                fromRow.Store();
+
+                // 终点
+                IRow toRow = stopsTable.CreateRow();
+                toRow.set_Value(stopsShapeIndex, _routeEndPoint);
+                toRow.Store();
+
+                // 4. 求解路径
+                INASolver solver = _naContext.Solver;
+                if (solver == null)
+                {
+                    MessageBox.Show("NAContext 中的 Solver 为空。", "路径分析",
+                        MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
+                
+
+                IGPMessages gpMessages = new GPMessagesClass();
+                solver.Solve(_naContext, gpMessages, null);
+
+                // 检查 GP 消息是否有错误
+
+
+                // 5. 从 Routes 表中读取路径几何
+                int routeShapeIndex = routesTable.FindField("Shape");
+                if (routeShapeIndex < 0)
+                {
+                    MessageBox.Show("Routes 表中未找到 Shape 字段。", "路径分析",
+                        MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
+
+                ICursor routeCursor = routesTable.Search(null, false);
+                IRow routeRow = routeCursor.NextRow();
+                if (routeRow == null)
+                {
+                    MessageBox.Show("没有求得路径结果。", "路径分析",
+                        MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+
+                IGeometry routeGeom = routeRow.get_Value(routeShapeIndex) as IGeometry;
+                if (routeGeom == null || routeGeom.IsEmpty)
+                {
+                    MessageBox.Show("路径结果几何为空。", "路径分析",
+                        MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+
+                // 6. 在地图上绘制路径
+                IMap map = axMapControl1.Map;
+                IGraphicsContainer gc = map as IGraphicsContainer;
+                IActiveView av = map as IActiveView;
+
+                if (gc == null || av == null)
+                {
+                    MessageBox.Show("无法获取地图图形容器。", "路径分析",
+                        MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
+
+                // 删除旧路径
+                if (_routePathElement != null)
+                {
+                    gc.DeleteElement(_routePathElement);
+                    _routePathElement = null;
+                }
+
+                IRgbColor lineColor = new RgbColorClass();
+                lineColor.Red = 0;
+                lineColor.Green = 0;
+                lineColor.Blue = 255;
+
+                ISimpleLineSymbol lineSymbol = new SimpleLineSymbolClass();
+                lineSymbol.Color = lineColor;
+                lineSymbol.Width = 2.5;
+                lineSymbol.Style = esriSimpleLineStyle.esriSLSSolid;
+
+                ILineElement lineElement = new LineElementClass();
+                lineElement.Symbol = lineSymbol;
+
+                _routePathElement = lineElement as IElement;
+                _routePathElement.Geometry = routeGeom;
+
+                gc.AddElement(_routePathElement, 0);
+                av.PartialRefresh(esriViewDrawPhase.esriViewGraphics, null, null);
+
+                // 可选：缩放到路径范围
+                IEnvelope env = routeGeom.Envelope;
+                if (env != null && !env.IsEmpty)
+                {
+                    env.Expand(1.2, 1.2, true);
+                    av.Extent = env;
+                    av.Refresh();
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("求解路径时发生错误：\n" + ex.Message,
+                    "路径分析错误",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        /// <summary>
+        /// 从 NetworkDataset 获取 DENetworkDataset（构建 NAContext 需要）
+        /// </summary>
+        private IDENetworkDataset GetDENetworkDatasetFromNetworkDataset(INetworkDataset networkDataset)
+        {
+            IDatasetComponent dsComponent = networkDataset as IDatasetComponent;
+            if (dsComponent == null)
+                return null;
+
+            return dsComponent.DataElement as IDENetworkDataset;
+        }
+
+        private void btnRoute_Click(object sender, EventArgs e)
+        {
+            // 初始化 NAContext
+            if (!InitNetworkAnalysis())
+                return;
+
+            // 清空之前的起终点和路径显示
+            IMap map = axMapControl1.Map;
+            IGraphicsContainer gc = map as IGraphicsContainer;
+            IActiveView av = map as IActiveView;
+            if (gc != null)
+            {
+                if (_routeStartElement != null) gc.DeleteElement(_routeStartElement);
+                if (_routeEndElement != null) gc.DeleteElement(_routeEndElement);
+                if (_routePathElement != null) gc.DeleteElement(_routePathElement);
+                _routeStartElement = null;
+                _routeEndElement = null;
+                _routePathElement = null;
+            }
+            if (av != null)
+                av.PartialRefresh(esriViewDrawPhase.esriViewGraphics, null, null);
+
+            _routeStartSet = false;
+            _routeStartPoint = null;
+            _routeEndPoint = null;
+            _isSettingRoutePoints = true;
+
+            MessageBox.Show("请在地图上点击起点，然后再点击终点。", "路径分析",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
     }
 }

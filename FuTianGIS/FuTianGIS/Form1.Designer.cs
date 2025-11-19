@@ -46,6 +46,9 @@
             this.btnBuffer = new System.Windows.Forms.Button();
             this.btnSelectByBuffer = new System.Windows.Forms.Button();
             this.btnExport = new System.Windows.Forms.Button();
+            this.btnEdit = new System.Windows.Forms.Button();
+            this.btnAddPoint = new System.Windows.Forms.Button();
+            this.btnRoute = new System.Windows.Forms.Button();
             ((System.ComponentModel.ISupportInitialize)(this.splitContainer1)).BeginInit();
             this.splitContainer1.Panel1.SuspendLayout();
             this.splitContainer1.Panel2.SuspendLayout();
@@ -135,6 +138,9 @@
             // 
             // panelButtons
             // 
+            this.panelButtons.Controls.Add(this.btnRoute);
+            this.panelButtons.Controls.Add(this.btnAddPoint);
+            this.panelButtons.Controls.Add(this.btnEdit);
             this.panelButtons.Controls.Add(this.btnExport);
             this.panelButtons.Controls.Add(this.btnSelectByBuffer);
             this.panelButtons.Controls.Add(this.btnBuffer);
@@ -273,6 +279,42 @@
             this.btnExport.UseVisualStyleBackColor = true;
             this.btnExport.Click += new System.EventHandler(this.btnExport_Click);
             // 
+            // btnEdit
+            // 
+            this.btnEdit.Dock = System.Windows.Forms.DockStyle.Left;
+            this.btnEdit.Font = new System.Drawing.Font("幼圆", 7.5F, System.Drawing.FontStyle.Bold, System.Drawing.GraphicsUnit.Point, ((byte)(134)));
+            this.btnEdit.Location = new System.Drawing.Point(467, 0);
+            this.btnEdit.Name = "btnEdit";
+            this.btnEdit.Size = new System.Drawing.Size(83, 39);
+            this.btnEdit.TabIndex = 9;
+            this.btnEdit.Text = "属性编辑";
+            this.btnEdit.UseVisualStyleBackColor = true;
+            this.btnEdit.Click += new System.EventHandler(this.btnEdit_Click);
+            // 
+            // btnAddPoint
+            // 
+            this.btnAddPoint.Dock = System.Windows.Forms.DockStyle.Left;
+            this.btnAddPoint.Font = new System.Drawing.Font("幼圆", 7.5F, System.Drawing.FontStyle.Bold, System.Drawing.GraphicsUnit.Point, ((byte)(134)));
+            this.btnAddPoint.Location = new System.Drawing.Point(550, 0);
+            this.btnAddPoint.Name = "btnAddPoint";
+            this.btnAddPoint.Size = new System.Drawing.Size(75, 39);
+            this.btnAddPoint.TabIndex = 10;
+            this.btnAddPoint.Text = "新增点";
+            this.btnAddPoint.UseVisualStyleBackColor = true;
+            this.btnAddPoint.Click += new System.EventHandler(this.btnAddPoint_Click);
+            // 
+            // btnRoute
+            // 
+            this.btnRoute.Dock = System.Windows.Forms.DockStyle.Left;
+            this.btnRoute.Font = new System.Drawing.Font("幼圆", 7.5F, System.Drawing.FontStyle.Bold, System.Drawing.GraphicsUnit.Point, ((byte)(134)));
+            this.btnRoute.Location = new System.Drawing.Point(625, 0);
+            this.btnRoute.Name = "btnRoute";
+            this.btnRoute.Size = new System.Drawing.Size(86, 39);
+            this.btnRoute.TabIndex = 11;
+            this.btnRoute.Text = "路径分析";
+            this.btnRoute.UseVisualStyleBackColor = true;
+            this.btnRoute.Click += new System.EventHandler(this.btnRoute_Click);
+            // 
             // MainForm
             // 
             this.AutoScaleDimensions = new System.Drawing.SizeF(9F, 18F);
@@ -328,6 +370,9 @@
         private System.Windows.Forms.Button btnBuffer;
         private System.Windows.Forms.Button btnSelectByBuffer;
         private System.Windows.Forms.Button btnExport;
+        private System.Windows.Forms.Button btnEdit;
+        private System.Windows.Forms.Button btnAddPoint;
+        private System.Windows.Forms.Button btnRoute;
     }
 }
 
