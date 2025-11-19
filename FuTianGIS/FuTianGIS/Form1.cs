@@ -1869,103 +1869,59 @@ namespace FuTianGIS
         }
 
         /// <summary>
-        /// 初始化 Network Analyst 上下文：从 FileGDB 中打开 Network Dataset，并创建 INAContext
+        /// 初始化 Network Analyst 上下文：
+        /// 直接从当前地图中已存在的“路线”网络分析图层 (INALayer) 获取 INAContext。
+        /// 这样 Stops/Routes 结构和求解参数与 ArcMap 中保持完全一致。
         /// </summary>
         private bool InitNetworkAnalysis()
         {
             try
             {
                 if (_naContext != null)
-                    return true; // 已经初始化过
+                    return true;
 
-                // TODO: 这里请填上你的 .gdb 完整路径
-                // 例如：C:\\Data\\FutianNetwork.gdb
-                string gdbPath = @"C:\YourPath\YourGdb.gdb";
-
-                // 要素数据集名称和 ND 名称，按你提供的配置
-                string featureDatasetName = "Network_Container";
-                string ndName = "Roads_Car_Clean_ND";
-
-                // 1. 打开 File GDB 工作空间
-                IWorkspaceFactory wsFactory = new FileGDBWorkspaceFactoryClass();
-                IFeatureWorkspace fws = wsFactory.OpenFromFile(gdbPath, 0) as IFeatureWorkspace;
-                if (fws == null)
+                IMap map = axMapControl1.Map;
+                if (map == null || map.LayerCount == 0)
                 {
-                    MessageBox.Show("无法打开 File GDB：" + gdbPath, "路径分析",
-                        MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    MessageBox.Show("当前地图中没有图层，无法初始化路径分析。", "路径分析",
+                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     return false;
                 }
 
-                // 2. 获取要素数据集
-                IFeatureDataset fd = fws.OpenFeatureDataset(featureDatasetName);
-                if (fd == null)
+                // 1. 在地图中查找 Network Analyst 路径图层 (INALayer)
+                INAContext foundContext = null;
+
+                for (int i = 0; i < map.LayerCount; i++)
                 {
-                    MessageBox.Show("在 GDB 中未找到要素数据集：" + featureDatasetName, "路径分析",
-                        MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    ILayer lyr = map.get_Layer(i);
+
+                    // 只要是 INALayer 就拿它的 Context
+                    INALayer naLayer = lyr as INALayer;
+                    if (naLayer != null && naLayer.Context != null)
+                    {
+                        foundContext = naLayer.Context;
+                        break;
+                    }
+                }
+
+                if (foundContext == null)
+                {
+                    MessageBox.Show(
+                        "在当前地图中未找到网络分析“路线”图层。\n\n" +
+                        "请确认 Futian.mxd 中已保存一个基于 Roads_Projected_ND 的路线分析图层，" +
+                        "并勾选可见后再运行本程序。",
+                        "路径分析",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Error);
                     return false;
                 }
 
-                // 3. 从 Feature Dataset 中找到 Network Dataset
-                //    Network Dataset 是 IDatasetContainer3 的一部分
-                IDatasetContainer3 dsContainer = fd as IDatasetContainer3;
-                if (dsContainer == null)
-                {
-                    MessageBox.Show("要素数据集不支持 Network Dataset 容器接口。", "路径分析",
-                        MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    return false;
-                }
-
-                IDataset nds = dsContainer.get_DatasetByName(esriDatasetType.esriDTNetworkDataset, ndName);
-                if (nds == null)
-                {
-                    MessageBox.Show("未在要素数据集中找到网络数据集：" + ndName, "路径分析",
-                        MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    return false;
-                }
-
-                INetworkDataset networkDataset = nds as INetworkDataset;
-                if (networkDataset == null)
-                {
-                    MessageBox.Show("获取到的对象不是 Network Dataset。", "路径分析",
-                        MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    return false;
-                }
-
-                // 4. 创建 NAContext
-                IDENetworkDataset deNetworkDataset = GetDENetworkDatasetFromNetworkDataset(networkDataset);
-                if (deNetworkDataset == null)
-                {
-                    MessageBox.Show("无法从 Network Dataset 获取 DENetworkDataset。", "路径分析",
-                        MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    return false;
-                }
-
-                INASolver naSolver = new NARouteSolverClass();
-                INAContextEdit naContextEdit = naSolver.CreateContext(deNetworkDataset, naSolver.Name) as INAContextEdit;
-                naContextEdit.Bind(networkDataset, new GPMessagesClass());
-                _naContext = naContextEdit as INAContext;
-
-                // 5. 设置默认的成本字段和限制
-                INASolverSettings solverSettings = naSolver as INASolverSettings;
-                if (solverSettings != null)
-                {
-                    // 成本属性名称：Minutes
-                    solverSettings.ImpedanceAttributeName = "Minutes";
-
-                    // 启用 Oneway 限制
-                    IStringArray restrictions = solverSettings.RestrictionAttributeNames;
-                    if (restrictions == null)
-                        restrictions = new StrArrayClass();
-                    restrictions.Add("Oneway");
-                    solverSettings.RestrictionAttributeNames = restrictions;
-                }
-
-
+                _naContext = foundContext;
                 return true;
             }
             catch (Exception ex)
             {
-                MessageBox.Show("初始化路径分析时发生错误：\n" + ex.Message,
+                MessageBox.Show("初始化路径分析时发生错误：\n" + ex.ToString(),
                     "路径分析错误",
                     MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return false;
@@ -1974,6 +1930,7 @@ namespace FuTianGIS
 
         private void SolveRoute()
         {
+
             try
             {
                 if (_naContext == null)
@@ -1994,12 +1951,23 @@ namespace FuTianGIS
                 INAClass routesNAClass = _naContext.NAClasses.get_ItemByName("Routes") as INAClass;
                 if (stopsNAClass == null || routesNAClass == null)
                 {
-                    MessageBox.Show("在 NAContext 中未找到 Stops 或 Routes 类，请检查网络数据集配置。", "路径分析",
+                    MessageBox.Show("在 NAContext 中未找到 \"Stops\" 或 \"Routes\" 类，请检查网络图层配置。", "路径分析",
                         MessageBoxButtons.OK, MessageBoxIcon.Error);
                     return;
                 }
 
-                // 2. 通过 ITable 接口清空上一次求解结果
+                // （可选）调试：确认拿到的 NAClass 名称
+                try
+                {
+                    string stopsName = stopsNAClass.ClassDefinition.Name;
+                    string routesName = routesNAClass.ClassDefinition.Name;
+                    MessageBox.Show(
+                        "调试：获取到 NAClass\nStops = " + stopsName + "\nRoutes = " + routesName,
+                        "路径分析调试");
+                }
+                catch { }
+
+                // 2. 通过 ITable 接口操作 NAClass
                 ITable stopsTable = stopsNAClass as ITable;
                 ITable routesTable = routesNAClass as ITable;
                 if (stopsTable == null || routesTable == null)
@@ -2009,41 +1977,53 @@ namespace FuTianGIS
                     return;
                 }
 
-                // 清空全部行
-                ICursor delCursor = stopsTable.Search(null, false);
-                IRow row = delCursor.NextRow();
-                while (row != null)
-                {
-                    row.Delete();
-                    row = delCursor.NextRow();
-                }
+                // 2.1 清空 Stops 表旧记录
+                // 使用 DeleteSearchedRows 可以一次性删除 Search 出来的所有行
+                IQueryFilter deleteFilter = new QueryFilterClass();
+                deleteFilter.WhereClause = "1=1";
+                stopsTable.DeleteSearchedRows(deleteFilter);
 
-                delCursor = routesTable.Search(null, false);
-                row = delCursor.NextRow();
-                while (row != null)
-                {
-                    row.Delete();
-                    row = delCursor.NextRow();
-                }
-
-                // 3. 向 Stops 表中添加起点和终点（通过 IRow）
-                int stopsShapeIndex = stopsTable.FindField("Shape");
-                if (stopsShapeIndex < 0)
+                // 3. 向 Stops 中添加起点和终点
+                int shapeIndex = stopsTable.FindField("Shape");
+                if (shapeIndex < 0)
                 {
                     MessageBox.Show("Stops 表中未找到 Shape 字段。", "路径分析",
                         MessageBoxButtons.OK, MessageBoxIcon.Error);
                     return;
                 }
 
-                // 起点
+                // 这两个字段在你的 Stops 表里是存在的
+                int routeNameIndex = stopsTable.FindField("RouteName");   // 路线名
+                int sequenceIndex = stopsTable.FindField("Sequence");    // 停靠点顺序
+
+                string routeNameValue = "Route1";   // 任意非空字符串即可，与你的场景无关
+
+                // 起点（序号 1）
                 IRow fromRow = stopsTable.CreateRow();
-                fromRow.set_Value(stopsShapeIndex, _routeStartPoint);
+                fromRow.set_Value(shapeIndex, _routeStartPoint);
+
+                if (routeNameIndex >= 0)
+                    fromRow.set_Value(routeNameIndex, routeNameValue);
+                if (sequenceIndex >= 0)
+                    fromRow.set_Value(sequenceIndex, 1);   // 起点 Sequence = 1
+
                 fromRow.Store();
 
-                // 终点
+                // 终点（序号 2）
                 IRow toRow = stopsTable.CreateRow();
-                toRow.set_Value(stopsShapeIndex, _routeEndPoint);
+                toRow.set_Value(shapeIndex, _routeEndPoint);
+
+                if (routeNameIndex >= 0)
+                    toRow.set_Value(routeNameIndex, routeNameValue);
+                if (sequenceIndex >= 0)
+                    toRow.set_Value(sequenceIndex, 2);     // 终点 Sequence = 2
+
                 toRow.Store();
+
+                // ★ 在调用 Solve 之前，加 RowCount 调试
+                int stopCount = stopsTable.RowCount(null);
+                MessageBox.Show("调试：当前 Stops 表中记录数 = " + stopCount,
+                    "路径分析调试");
 
                 // 4. 求解路径
                 INASolver solver = _naContext.Solver;
@@ -2053,15 +2033,14 @@ namespace FuTianGIS
                         MessageBoxButtons.OK, MessageBoxIcon.Error);
                     return;
                 }
-                
 
+                // 这里先不再设置搜索容差，使用 Network Dataset 的默认配置
                 IGPMessages gpMessages = new GPMessagesClass();
                 solver.Solve(_naContext, gpMessages, null);
 
-                // 检查 GP 消息是否有错误
+                // 如果 Solve 抛异常会直接到 catch，这里暂不解析 gpMessages
 
-
-                // 5. 从 Routes 表中读取路径几何
+                // 5. 从 Routes 表读取路径几何
                 int routeShapeIndex = routesTable.FindField("Shape");
                 if (routeShapeIndex < 0)
                 {
@@ -2125,7 +2104,7 @@ namespace FuTianGIS
                 gc.AddElement(_routePathElement, 0);
                 av.PartialRefresh(esriViewDrawPhase.esriViewGraphics, null, null);
 
-                // 可选：缩放到路径范围
+                // 缩放到路径范围
                 IEnvelope env = routeGeom.Envelope;
                 if (env != null && !env.IsEmpty)
                 {

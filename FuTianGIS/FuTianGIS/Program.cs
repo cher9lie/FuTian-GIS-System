@@ -16,67 +16,43 @@ namespace FuTianGIS
         [STAThread]
         static void Main()
         {
-            // 第 0 步：绑定 ArcGIS 产品类型
-            if (!RuntimeManager.Bind(ProductCode.Engine))
+            // 1. 绑定 ArcGIS Engine/Runtime
+            ESRI.ArcGIS.RuntimeManager.Bind(ESRI.ArcGIS.ProductCode.Engine);
+
+            // 2. 初始化许可：Engine + Network Analyst 扩展
+            IAoInitialize aoInit = new AoInitializeClass();
+
+            // 先初始化 Engine 许可（如果你用的是 Desktop Advanced 之类，这里可以换成 Desktop）
+            esriLicenseStatus status = aoInit.Initialize(esriLicenseProductCode.esriLicenseProductCodeEngine);
+            if (status != esriLicenseStatus.esriLicenseCheckedOut)
             {
-                // 如果绑定 Engine 失败，尝试 Desktop
-                if (!RuntimeManager.Bind(ProductCode.Desktop))
-                {
-                    MessageBox.Show(
-                        "无法绑定到 ArcGIS Engine 或 Desktop 运行环境！\n" +
-                        "请检查是否已正确安装 ArcGIS Engine Runtime 或 ArcGIS Desktop。",
-                        "绑定错误",
-                        MessageBoxButtons.OK,
-                        MessageBoxIcon.Error
-                    );
-                    return;
-                }
+                MessageBox.Show("无法获取 ArcGIS Engine 许可，程序将退出。", "许可错误",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
             }
 
-            // 第 1 步：初始化 ArcGIS 许可
-            if (!InitializeLicense())
+            // 再启用 Network Analyst 扩展
+            esriLicenseStatus naStatus = aoInit.CheckOutExtension(esriLicenseExtensionCode.esriLicenseExtensionCodeNetwork);
+            if (naStatus != esriLicenseStatus.esriLicenseCheckedOut)
             {
-                MessageBox.Show(
-                    "无法获取 ArcGIS 许可！\n\n请确保：\n" +
-                    "1. 已安装 ArcGIS Engine Runtime 或 ArcGIS Desktop 10.x\n" +
-                    "2. 许可管理器中有有效的许可（Engine 或 Desktop）",
-                    "许可错误",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Error
-                );
-                return; // 退出程序
+                MessageBox.Show("无法获取 Network Analyst 扩展许可，路径分析功能将不可用。", "许可错误",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                // 这里可以选择继续运行（只是不能用路径分析），也可以直接退出
+                // return;
             }
 
-            // 第 2 步：启动 Windows 窗体应用程序
-            try
-            {
-                Application.EnableVisualStyles();
-                Application.SetCompatibleTextRenderingDefault(false);
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            Application.Run(new MainForm());
 
-                // 先显示登录窗体
-                LoginForm loginForm = new LoginForm();
-                if (loginForm.ShowDialog() == DialogResult.OK)
-                {
-                    Application.Run(new MainForm());
-                }
-                else
-                {
-                    return;
-                }
-            }
-            catch (Exception ex)
+            // 3. 程序退出前释放扩展许可
+            if (naStatus == esriLicenseStatus.esriLicenseCheckedOut)
             {
-                MessageBox.Show(
-                    "程序运行时出错：\n" + ex.Message,
-                    "运行时错误",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Error
-                );
+                aoInit.CheckInExtension(esriLicenseExtensionCode.esriLicenseExtensionCodeNetwork);
             }
-            finally
+            if (status == esriLicenseStatus.esriLicenseCheckedOut)
             {
-                // 第 3 步：关闭许可
-                ShutdownLicense();
+                aoInit.Shutdown();
             }
         }
 
