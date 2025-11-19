@@ -1,6 +1,8 @@
 ﻿using System;
 using System.IO;
 using System.Collections.Generic;
+using System.Windows.Forms.DataVisualization.Charting;
+using System.Runtime.InteropServices;
 using System.ComponentModel;
 using System.Data;
 using System.Drawing;
@@ -16,11 +18,18 @@ using ESRI.ArcGIS.DataSourcesFile;
 using ESRI.ArcGIS.DataSourcesGDB;
 using ESRI.ArcGIS.Geometry;
 using ESRI.ArcGIS.esriSystem;
+using ESRI.ArcGIS.Output;
 
 namespace FuTianGIS
 {
     public partial class MainForm : Form
     {
+        // 最近一次生成的缓冲几何，供功能 10 复用
+        private IGeometry _lastBufferGeometry;
+        // ... 你已有的字段 ...
+        private string _lastStatsFieldName = null;
+        // 统计窗口引用（选中变化时重用）
+        private StatsChartForm _statsForm;
         private void ApplyUniqueValueRenderer(IFeatureLayer featureLayer, string fieldName)
         {
             if (featureLayer == null || featureLayer.FeatureClass == null)
@@ -654,68 +663,562 @@ namespace FuTianGIS
             }
         }
 
-
-
-    }
-    // 简单的字段选择对话框
-    internal class FieldSelectForm : Form
+        private void axMapControl1_OnSelectionChanged(object sender, EventArgs e)
+        {
+    try
     {
-        private ComboBox comboFields;
-        private Button btnOk;
-        private Button btnCancel;
-
-        public string SelectedFieldName
+        // 1. 获取当前要操作的图层
+        IFeatureLayer layer = GetCurrentFeatureLayer();
+        if (layer == null || layer.FeatureClass == null)
         {
-            get
+            if (_statsForm != null && !_statsForm.IsDisposed)
+                _statsForm.Close();
+            return;
+        }
+
+        IFeatureSelection featSel = layer as IFeatureSelection;
+        if (featSel == null || featSel.SelectionSet == null || featSel.SelectionSet.Count == 0)
+        {
+            // 没有选中要素，关闭统计窗
+            if (_statsForm != null && !_statsForm.IsDisposed)
+                _statsForm.Close();
+            return;
+        }
+
+        IFeatureClass fc = layer.FeatureClass;
+
+        // 2. 每次都重新弹出对话框选择统计字段
+        List<string> candidates = new List<string>();
+        IFields fields = fc.Fields;
+
+        for (int i = 0; i < fields.FieldCount; i++)
+        {
+            IField f = fields.get_Field(i);
+
+            // 只把适合做统计的字段加入，例如字符串、整数、小整数
+            if ((f.Type == esriFieldType.esriFieldTypeString ||
+                 f.Type == esriFieldType.esriFieldTypeInteger ||
+                 f.Type == esriFieldType.esriFieldTypeSmallInteger) &&
+                !f.Name.Equals(fc.ShapeFieldName, StringComparison.OrdinalIgnoreCase) &&
+                !f.Name.Equals(fc.OIDFieldName, StringComparison.OrdinalIgnoreCase))
             {
-                return comboFields.SelectedItem as string;
+                candidates.Add(f.Name);
             }
         }
 
-        public FieldSelectForm(System.Collections.Generic.IEnumerable<string> fieldNames)
+        if (candidates.Count == 0)
         {
-            this.Text = "选择渲染字段";
-            this.StartPosition = FormStartPosition.CenterParent;
-            this.FormBorderStyle = FormBorderStyle.FixedDialog;
-            this.MaximizeBox = false;
-            this.MinimizeBox = false;
-            this.Width = 320;
-            this.Height = 150;
-
-            comboFields = new ComboBox();
-            comboFields.DropDownStyle = ComboBoxStyle.DropDownList;
-            comboFields.Left = 15;
-            comboFields.Top = 15;
-            comboFields.Width = 270;
-
-            foreach (var name in fieldNames)
-            {
-                comboFields.Items.Add(name);
-            }
-            if (comboFields.Items.Count > 0)
-                comboFields.SelectedIndex = 0;
-
-            btnOk = new Button();
-            btnOk.Text = "确定";
-            btnOk.DialogResult = DialogResult.OK;
-            btnOk.Left = 70;
-            btnOk.Top = 60;
-            btnOk.Width = 75;
-
-            btnCancel = new Button();
-            btnCancel.Text = "取消";
-            btnCancel.DialogResult = DialogResult.Cancel;
-            btnCancel.Left = 165;
-            btnCancel.Top = 60;
-            btnCancel.Width = 75;
-
-            this.AcceptButton = btnOk;
-            this.CancelButton = btnCancel;
-
-            this.Controls.Add(comboFields);
-            this.Controls.Add(btnOk);
-            this.Controls.Add(btnCancel);
+            MessageBox.Show("当前图层没有适合用于统计的字段。", "统计",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            if (_statsForm != null && !_statsForm.IsDisposed)
+                _statsForm.Close();
+            return;
         }
 
+        string fieldName = null;
+        using (FieldSelectForm dlg = new FieldSelectForm(candidates))
+        {
+            dlg.Text = "选择统计字段";
+            if (dlg.ShowDialog(this) != DialogResult.OK)
+            {
+                // 用户取消，不统计
+                return;
+            }
+
+            fieldName = dlg.SelectedFieldName;
+        }
+
+        if (string.IsNullOrEmpty(fieldName))
+            return;
+
+        int fieldIndex = fc.FindField(fieldName);
+        if (fieldIndex < 0)
+            return;
+
+        // 3. 遍历选择集，统计各个字段值的数量
+        Dictionary<string, int> counts = new Dictionary<string, int>();
+
+        ISelectionSet selSet = featSel.SelectionSet;
+        ICursor cursor;
+        selSet.Search(null, true, out cursor);
+        IFeatureCursor fCursor = cursor as IFeatureCursor;
+        IFeature feature = fCursor.NextFeature();
+
+        while (feature != null)
+        {
+            object val = feature.get_Value(fieldIndex);
+            string key = (val == null || val == DBNull.Value) ? "(空)" : val.ToString();
+
+            if (!counts.ContainsKey(key))
+                counts[key] = 0;
+            counts[key]++;
+
+            feature = fCursor.NextFeature();
+        }
+
+        if (counts.Count == 0)
+        {
+            if (_statsForm != null && !_statsForm.IsDisposed)
+                _statsForm.Close();
+            return;
+        }
+
+        // 4. 打开或更新统计窗口
+        if (_statsForm == null || _statsForm.IsDisposed)
+        {
+            _statsForm = new StatsChartForm();
+            _statsForm.Show(this);   // 非模态窗口
+        }
+
+        var chart = _statsForm.ChartControl;
+        chart.Series.Clear();
+
+        var series = chart.Series.Add("统计");
+        series.ChartType = SeriesChartType.Column;
+        series.IsValueShownAsLabel = true;
+
+        foreach (var kv in counts)
+        {
+            series.Points.AddXY(kv.Key, kv.Value);
+        }
+
+        if (chart.ChartAreas.Count > 0)
+        {
+            chart.ChartAreas[0].AxisX.Interval = 1;
+        }
+
+        _statsForm.Text = "统计图表 - 图层：{layer.Name}，字段：{fieldName}";
+    }
+    catch (Exception ex)
+    {
+        MessageBox.Show("更新统计图表时出错：\n" + ex.Message,
+            "统计错误",
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Error);
+    }
+   }
+        /// <summary>
+        /// 统计图表窗口：单独弹出的 Form，内部一个 Chart 控件
+        /// </summary>
+        internal class StatsChartForm : Form
+        {
+            public System.Windows.Forms.DataVisualization.Charting.Chart ChartControl { get; private set; }
+
+            public StatsChartForm()
+            {
+                this.Text = "统计图表";
+                this.StartPosition = FormStartPosition.CenterParent;
+                this.Width = 600;
+                this.Height = 400;
+
+                ChartControl = new System.Windows.Forms.DataVisualization.Charting.Chart();
+                ChartControl.Dock = DockStyle.Fill;
+
+                // 基本 ChartArea / Series（后面代码会重建 Series，这里只是初始化）
+                var chartArea = new System.Windows.Forms.DataVisualization.Charting.ChartArea("ChartArea1");
+                ChartControl.ChartAreas.Add(chartArea);
+
+                this.Controls.Add(ChartControl);
+            }
+        }
+        // 简单的字段选择对话框
+        internal class FieldSelectForm : Form
+        {
+            private ComboBox comboFields;
+            private Button btnOk;
+            private Button btnCancel;
+
+            public string SelectedFieldName
+            {
+                get
+                {
+                    return comboFields.SelectedItem as string;
+                }
+            }
+
+            public FieldSelectForm(System.Collections.Generic.IEnumerable<string> fieldNames)
+            {
+                this.Text = "选择渲染字段";
+                this.StartPosition = FormStartPosition.CenterParent;
+                this.FormBorderStyle = FormBorderStyle.FixedDialog;
+                this.MaximizeBox = false;
+                this.MinimizeBox = false;
+                this.Width = 320;
+                this.Height = 150;
+
+                comboFields = new ComboBox();
+                comboFields.DropDownStyle = ComboBoxStyle.DropDownList;
+                comboFields.Left = 15;
+                comboFields.Top = 15;
+                comboFields.Width = 270;
+
+                foreach (var name in fieldNames)
+                {
+                    comboFields.Items.Add(name);
+                }
+                if (comboFields.Items.Count > 0)
+                    comboFields.SelectedIndex = 0;
+
+                btnOk = new Button();
+                btnOk.Text = "确定";
+                btnOk.DialogResult = DialogResult.OK;
+                btnOk.Left = 70;
+                btnOk.Top = 60;
+                btnOk.Width = 75;
+
+                btnCancel = new Button();
+                btnCancel.Text = "取消";
+                btnCancel.DialogResult = DialogResult.Cancel;
+                btnCancel.Left = 165;
+                btnCancel.Top = 60;
+                btnCancel.Width = 75;
+
+                this.AcceptButton = btnOk;
+                this.CancelButton = btnCancel;
+
+                this.Controls.Add(comboFields);
+                this.Controls.Add(btnOk);
+                this.Controls.Add(btnCancel);
+            }
+
+        }
+
+        private void btnBuffer_Click(object sender, EventArgs e)
+{
+    try
+    {
+        // 1. 获取当前要操作的图层
+        IFeatureLayer layer = GetCurrentFeatureLayer();
+        if (layer == null || layer.FeatureClass == null)
+        {
+            MessageBox.Show("当前没有可用的要素图层。", "缓冲区",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        IFeatureSelection featSel = layer as IFeatureSelection;
+        if (featSel == null || featSel.SelectionSet == null || featSel.SelectionSet.Count == 0)
+        {
+            MessageBox.Show("请先在地图上选择至少一个要素（通过搜索或拉框选择）。", "缓冲区",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        IFeatureClass fc = layer.FeatureClass;
+
+        // 2. 取第一个选中要素的几何，生成缓冲（以米为单位假设投影坐标）
+        ISelectionSet selSet = featSel.SelectionSet;
+        ICursor cursor;
+        selSet.Search(null, true, out cursor);
+        IFeatureCursor fCursor = cursor as IFeatureCursor;
+        IFeature feature = fCursor.NextFeature();
+
+        if (feature == null || feature.Shape == null || feature.Shape.IsEmpty)
+        {
+            MessageBox.Show("选中要素没有有效几何。", "缓冲区",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        IGeometry geom = feature.ShapeCopy; // 使用副本
+        ITopologicalOperator topo = geom as ITopologicalOperator;
+        if (topo == null)
+        {
+            MessageBox.Show("该要素不支持缓冲运算。", "缓冲区",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        // 缓冲半径 500（单位取决于地图投影，一般是米）
+        double bufferDistance = 500.0;
+        IGeometry bufferGeom = topo.Buffer(bufferDistance);
+
+        if (bufferGeom == null || bufferGeom.IsEmpty)
+        {
+            MessageBox.Show("缓冲区生成失败。", "缓冲区",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        // 3. 把缓冲几何画到地图的图形层上（红色半透明面）
+        IMap map = axMapControl1.Map;
+        IActiveView activeView = map as IActiveView;
+        IGraphicsContainer graphicsContainer = map as IGraphicsContainer;
+
+        if (graphicsContainer == null)
+        {
+            MessageBox.Show("无法获取图形容器。", "缓冲区",
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
+        }
+
+        // 可选：先清除之前生成的缓冲元素（如果你只想保留最新一个）
+        graphicsContainer.DeleteAllElements();
+
+        // 创建符号：红色半透明填充 + 红色边线
+        IRgbColor fillColor = new RgbColorClass();
+        fillColor.Red = 255;
+        fillColor.Green = 0;
+        fillColor.Blue = 0;
+        fillColor.Transparency = 80;   // 0–255，越小越透明
+
+        IRgbColor outlineColor = new RgbColorClass();
+        outlineColor.Red = 255;
+        outlineColor.Green = 0;
+        outlineColor.Blue = 0;
+        outlineColor.Transparency = 255;
+
+        ISimpleLineSymbol outline = new SimpleLineSymbolClass();
+        outline.Color = outlineColor;
+        outline.Width = 1.5;
+        outline.Style = esriSimpleLineStyle.esriSLSSolid;
+
+        ISimpleFillSymbol fillSymbol = new SimpleFillSymbolClass();
+        fillSymbol.Color = fillColor;
+        fillSymbol.Style = esriSimpleFillStyle.esriSFSSolid;
+        fillSymbol.Outline = outline;
+
+        IFillShapeElement fillElement = new PolygonElementClass();
+        IElement element = (IElement)fillElement;
+        element.Geometry = bufferGeom;
+        fillElement.Symbol = fillSymbol;
+
+        graphicsContainer.AddElement(element, 0);
+
+        // 4. 保存缓冲几何，供后续邻近查询使用
+        _lastBufferGeometry = bufferGeom;
+
+        // 5. 刷新图形层
+        activeView.PartialRefresh(esriViewDrawPhase.esriViewGraphics, null, null);
+
+        MessageBox.Show("已在图形层生成 {bufferDistance} 范围的缓冲区。", "缓冲区",
+            MessageBoxButtons.OK, MessageBoxIcon.Information);
+    }
+    catch (Exception ex)
+    {
+        MessageBox.Show("缓冲区分析时发生错误：\n" + ex.Message,
+            "缓冲区错误",
+            MessageBoxButtons.OK, MessageBoxIcon.Error);
+    }
+}
+
+        private void btnSelectByBuffer_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                if (_lastBufferGeometry == null || _lastBufferGeometry.IsEmpty)
+                {
+                    MessageBox.Show("尚未生成缓冲区，请先对选中要素执行“缓冲区”操作。", "缓冲选取",
+                        MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+
+                IMap map = axMapControl1.Map;
+                if (map == null || map.LayerCount == 0)
+                {
+                    MessageBox.Show("当前地图中没有图层。", "缓冲选取",
+                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                List<IFeatureLayer> featureLayers = new List<IFeatureLayer>();
+                List<string> layerNames = new List<string>();
+
+                for (int i = 0; i < map.LayerCount; i++)
+                {
+                    ILayer lyr = map.get_Layer(i);
+                    IFeatureLayer fl = lyr as IFeatureLayer;
+                    if (fl != null)
+                    {
+                        featureLayers.Add(fl);
+                        layerNames.Add(fl.Name);
+                    }
+                }
+
+                if (featureLayers.Count == 0)
+                {
+                    MessageBox.Show("当前地图中没有要素图层可供查询。", "缓冲选取",
+                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                string targetLayerName = null;
+                using (Form dlg = new Form())
+                {
+                    dlg.Text = "选择邻近查询的目标图层";
+                    dlg.StartPosition = FormStartPosition.CenterParent;
+                    dlg.FormBorderStyle = FormBorderStyle.FixedDialog;
+                    dlg.MaximizeBox = false;
+                    dlg.MinimizeBox = false;
+                    dlg.Width = 350;
+                    dlg.Height = 150;
+
+                    ComboBox cmb = new ComboBox();
+                    cmb.DropDownStyle = ComboBoxStyle.DropDownList;
+                    cmb.Left = 15;
+                    cmb.Top = 15;
+                    cmb.Width = 300;
+
+                    foreach (string name in layerNames)
+                        cmb.Items.Add(name);
+                    if (cmb.Items.Count > 0) cmb.SelectedIndex = 0;
+
+                    Button btnOk = new Button();
+                    btnOk.Text = "确定";
+                    btnOk.DialogResult = DialogResult.OK;
+                    btnOk.Left = 70;
+                    btnOk.Top = 60;
+                    btnOk.Width = 80;
+
+                    Button btnCancel = new Button();
+                    btnCancel.Text = "取消";
+                    btnCancel.DialogResult = DialogResult.Cancel;
+                    btnCancel.Left = 170;
+                    btnCancel.Top = 60;
+                    btnCancel.Width = 80;
+
+                    dlg.AcceptButton = btnOk;
+                    dlg.CancelButton = btnCancel;
+                    dlg.Controls.Add(cmb);
+                    dlg.Controls.Add(btnOk);
+                    dlg.Controls.Add(btnCancel);
+
+                    if (dlg.ShowDialog(this) != DialogResult.OK)
+                        return;
+
+                    targetLayerName = cmb.SelectedItem as string;
+                }
+
+                if (string.IsNullOrEmpty(targetLayerName))
+                    return;
+
+                IFeatureLayer targetLayer = null;
+                for (int i = 0; i < featureLayers.Count; i++)
+                {
+                    if (featureLayers[i].Name == targetLayerName)
+                    {
+                        targetLayer = featureLayers[i];
+                        break;
+                    }
+                }
+
+                if (targetLayer == null || targetLayer.FeatureClass == null)
+                {
+                    MessageBox.Show("未能获取目标图层。", "缓冲选取",
+                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                IFeatureClass targetFc = targetLayer.FeatureClass;
+                ISpatialFilter spatialFilter = new SpatialFilterClass();
+                spatialFilter.Geometry = _lastBufferGeometry;
+                spatialFilter.SpatialRel = esriSpatialRelEnum.esriSpatialRelIntersects;
+                spatialFilter.GeometryField = targetFc.ShapeFieldName;
+
+                IFeatureSelection targetSelection = targetLayer as IFeatureSelection;
+                if (targetSelection == null)
+                {
+                    MessageBox.Show("目标图层不支持要素选择。", "缓冲选取",
+                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                targetSelection.Clear();
+                targetSelection.SelectFeatures(
+                    spatialFilter,
+                    esriSelectionResultEnum.esriSelectionResultNew,
+                    false);
+
+                ISelectionSet selSetRes = targetSelection.SelectionSet;
+                int count = (selSetRes == null) ? 0 : selSetRes.Count;
+
+                IActiveView activeView = map as IActiveView;
+                activeView.PartialRefresh(esriViewDrawPhase.esriViewGeography, null, null);
+                activeView.PartialRefresh(esriViewDrawPhase.esriViewGeoSelection, null, null);
+
+                MessageBox.Show(
+                    string.Format("在缓冲区范围内，共找到 {0} 个要素。\n\n目标图层：{1}", count, targetLayer.Name),
+                    "缓冲选取结果",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("缓冲选取时发生错误：\n" + ex.Message,
+                    "缓冲选取错误",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
+        }
+
+        private void btnExport_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                IActiveView activeView = axMapControl1.ActiveView;
+                if (activeView == null)
+                {
+                    MessageBox.Show("当前没有可导出的地图视图。", "导出 PDF",
+                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                // 1. 选择导出路径（也可以直接写死到程序目录，这里用对话框更友好）
+                using (SaveFileDialog dlg = new SaveFileDialog())
+                {
+                    dlg.Title = "导出地图为 PDF";
+                    dlg.Filter = "PDF 文件 (*.pdf)|*.pdf";
+                    dlg.FileName = "MapOutput.pdf";
+
+                    if (dlg.ShowDialog(this) != DialogResult.OK)
+                        return;
+
+                    string outPath = dlg.FileName;
+                    if (string.IsNullOrEmpty(outPath))
+                        return;
+
+                    // 2. 创建 PDF 导出对象
+                    IExport export = new ExportPDFClass();
+                    export.ExportFileName = outPath;
+
+                    // 3. 设置分辨率（DPI）
+                    export.Resolution = 300;   // 300 dpi，一般打印质量
+
+                    tagRECT exportRect;
+                    exportRect.left = 0;
+                    exportRect.top = 0;
+                    exportRect.right = activeView.ExportFrame.right;
+                    exportRect.bottom = activeView.ExportFrame.bottom;
+                    export.PixelBounds = new EnvelopeClass
+                    {
+                        XMin = exportRect.left,
+                        YMin = exportRect.top,
+                        XMax = exportRect.right,
+                        YMax = exportRect.bottom
+                    };
+
+                    // 4. 开始导出
+                    int hDC = export.StartExporting();
+                    activeView.Output(hDC, (int)export.Resolution, ref exportRect, null, null);
+                    export.FinishExporting();
+                    export.Cleanup();
+
+                    // 可选：释放 COM
+                    Marshal.ReleaseComObject(export);
+
+                    MessageBox.Show("地图已成功导出为 PDF：\n" + outPath,
+                        "导出 PDF",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information);
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("导出 PDF 时发生错误：\n" + ex.Message,
+                    "导出 PDF 错误",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
+        }
     }
 }
