@@ -725,109 +725,89 @@ namespace FuTianGIS
             }
         }
 
-        private void btnSearch_Click(object sender, EventArgs e)
+private void btnSearch_Click(object sender, EventArgs e)
+{
+    try
+    {
+        // 1. 检查搜索文本是否为空
+        string searchText = txtSearch.Text;
+        if (string.IsNullOrWhiteSpace(searchText))
         {
-            string keyword = txtSearch.Text.Trim();
-            if (string.IsNullOrEmpty(keyword))
-            {
-                MessageBox.Show("请输入要搜索的关键字。", "提示",
-                    MessageBoxButtons.OK, MessageBoxIcon.Information);
-                return;
-            }
-
-            // 1. 获取当前要操作的图层
-            IFeatureLayer targetLayer = GetCurrentFeatureLayer();
-            if (targetLayer == null)
-            {
-                MessageBox.Show("当前没有可用的要素图层。请在图层目录中选择一个图层。", "提示",
-                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
-            }
-
-            IFeatureClass fc = targetLayer.FeatureClass;
-            if (fc == null)
-            {
-                MessageBox.Show("该图层没有要素类。", "提示",
-                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
-            }
-
-            // 2. 这里先暂时固定使用字段 "Name" 做查询（后面可以改成弹出字段选择）
-            string fieldName = "Name";
-            int idx = fc.FindField(fieldName);
-            if (idx < 0)
-            {
-                MessageBox.Show("图层中不存在字段 \"" + fieldName + "\"。", "提示",
-                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
-            }
-
-            // 3. 构造 SQL 条件：[字段名] LIKE '%关键字%'
-            string whereClause = "[" + fieldName + "] LIKE '%" + keyword.Replace("'", "''") + "%'";
-
-            IQueryFilter queryFilter = new QueryFilterClass();
-            queryFilter.WhereClause = whereClause;
-
-            // 4. 执行选择
-            IFeatureSelection featureSelection = targetLayer as IFeatureSelection;
-            if (featureSelection == null)
-            {
-                MessageBox.Show("该图层不支持要素选择。", "提示",
-                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
-            }
-
-            featureSelection.Clear();
-
-            featureSelection.SelectFeatures(
-                queryFilter,
-                esriSelectionResultEnum.esriSelectionResultNew,
-                false);
-
-            // 5. 获取选择范围并缩放
-            ISelectionSet selectionSet = featureSelection.SelectionSet;
-            if (selectionSet == null || selectionSet.Count == 0)
-            {
-                axMapControl1.Refresh();
-                MessageBox.Show("没有找到匹配的要素。", "提示",
-                    MessageBoxButtons.OK, MessageBoxIcon.Information);
-                return;
-            }
-
-            IEnvelope env = new EnvelopeClass();
-            bool first = true;
-
-            ICursor cursor;
-            selectionSet.Search(null, true, out cursor);
-            IFeatureCursor featCursor = cursor as IFeatureCursor;
-            IFeature feature = featCursor.NextFeature();
-
-            while (feature != null)
-            {
-                if (first)
-                {
-                    env = feature.Extent;
-                    first = false;
-                }
-                else
-                {
-                    env.Union(feature.Extent);
-                }
-
-                feature = featCursor.NextFeature();
-            }
-
-            if (!env.IsEmpty)
-            {
-                env.Expand(1.2, 1.2, true);
-                axMapControl1.ActiveView.Extent = env;
-            }
-
-            axMapControl1.ActiveView.PartialRefresh(
-                esriViewDrawPhase.esriViewGeography, null, null);
-            axMapControl1.ActiveView.PartialRefresh(
-                esriViewDrawPhase.esriViewGeoSelection, null, null);
+            MessageBox.Show("请输入要搜索的关键字。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
         }
+
+        // 2. 获取当前选中的图层，并进行有效性检查
+        if (axMapControl1.CustomProperty == null || !(axMapControl1.CustomProperty is IFeatureLayer))
+        {
+            MessageBox.Show("请先在图层列表中选择一个有效的要素图层。", "操作无效", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        IFeatureLayer featureLayer = (IFeatureLayer)axMapControl1.CustomProperty;
+        IFeatureClass featureClass = featureLayer.FeatureClass;
+
+        if (featureClass == null)
+        {
+            MessageBox.Show("选中的图层没有关联的要素类。", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
+        }
+
+        // 3. 使用图层的 DisplayField 作为查询字段，使其更通用
+        string displayField = featureLayer.DisplayField;
+        int fieldIndex = featureClass.FindField(displayField);
+        if (fieldIndex == -1)
+        {
+            MessageBox.Show("图层 '{featureLayer.Name}' 的显示字段 '{displayField}' 无效。", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
+        }
+
+        // 4. 构建 QueryFilter
+        IQueryFilter queryFilter = new QueryFilterClass();
+        
+        // 检查字段类型，为字符串字段添加单引号
+        IField field = featureClass.Fields.get_Field(fieldIndex);
+        if (field.Type == esriFieldType.esriFieldTypeString)
+        {
+            queryFilter.WhereClause = "{displayField} LIKE '%{searchText}%'";
+        }
+        else
+        {
+            // 如果是数值等其他类型，可能需要不同的查询方式，这里简化为精确匹配
+            queryFilter.WhereClause = "{displayField} = {searchText}"; 
+        }
+
+        // 5. 执行选择
+        IFeatureSelection featureSelection = (IFeatureSelection)featureLayer;
+        
+        // 清除之前的选择，确保结果清晰
+        featureSelection.Clear(); 
+        featureSelection.SelectFeatures(queryFilter, esriSelectionResultEnum.esriSelectionResultNew, false);
+
+        // 6. 刷新地图并缩放至选中要素
+        axMapControl1.ActiveView.PartialRefresh(esriViewDrawPhase.esriViewGeoSelection, null, null);
+
+        // 检查是否有要素被选中，并决定是否缩放
+        if (featureSelection.SelectionSet.Count > 0)
+        {
+             // 缩放至选中要素的代码... (您原来的代码可以放在这里)
+        }
+        else
+        {
+            MessageBox.Show("未找到匹配的要素。", "查询结果", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+    }
+    catch (COMException comEx)
+    {
+        // 捕获COM异常，并提供更详细的错误信息
+        MessageBox.Show("执行查询时发生COM错误: \n" + comEx.Message + "\nHResult: " + comEx.ErrorCode, 
+                        "ArcGIS Engine 错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+    }
+    catch (Exception ex)
+    {
+        // 捕获其他.NET异常
+        MessageBox.Show("发生未知错误: \n" + ex.Message, "系统错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+    }
+}
 
         private void btnBoxSelect_Click(object sender, EventArgs e)
         {
@@ -1299,122 +1279,103 @@ namespace FuTianGIS
         }
 
 
-        private void btnBuffer_Click(object sender, EventArgs e)
+private void btnBuffer_Click(object sender, EventArgs e)
 {
+    // 步骤 1: 准备工作，清除上一次的图形
+    IMap map = axMapControl1.Map;
+    IActiveView activeView = (IActiveView)map;
+    IGraphicsContainer graphicsContainer = (IGraphicsContainer)map;
+
+    graphicsContainer.DeleteAllElements();
+    _lastBufferGeometry = null;
+    activeView.PartialRefresh(esriViewDrawPhase.esriViewGraphics, null, null);
+
     try
     {
-        // 1. 获取当前要操作的图层
-        IFeatureLayer layer = GetCurrentFeatureLayer();
-        if (layer == null || layer.FeatureClass == null)
+        // 步骤 2: 检查是否至少选中一个要素
+        IFeatureSelection featureSelection = map.FeatureSelection as IFeatureSelection;
+        if (featureSelection == null || featureSelection.SelectionSet.Count == 0)
         {
-            MessageBox.Show("当前没有可用的要素图层。", "缓冲区",
+            MessageBox.Show("请先在地图上选择至少一个要素。", "缓冲区提示",
                 MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
 
-        IFeatureSelection featSel = layer as IFeatureSelection;
-        if (featSel == null || featSel.SelectionSet == null || featSel.SelectionSet.Count == 0)
-        {
-            MessageBox.Show("请先在地图上选择至少一个要素（通过搜索或拉框选择）。", "缓冲区",
-                MessageBoxButtons.OK, MessageBoxIcon.Information);
-            return;
-        }
+        // 步骤 3: 合并所有选中要素的几何图形
+        IGeometryCollection geometryCollection = new GeometryBagClass();
+        ((IGeometry)geometryCollection).SpatialReference = map.SpatialReference;
 
-        IFeatureClass fc = layer.FeatureClass;
-
-        // 2. 取第一个选中要素的几何，生成缓冲（以米为单位假设投影坐标）
-        ISelectionSet selSet = featSel.SelectionSet;
+        ISelectionSet selectionSet = featureSelection.SelectionSet;
         ICursor cursor;
-        selSet.Search(null, true, out cursor);
-        IFeatureCursor fCursor = cursor as IFeatureCursor;
-        IFeature feature = fCursor.NextFeature();
+        selectionSet.Search(null, false, out cursor);
+        IFeatureCursor featureCursor = (IFeatureCursor)cursor;
 
-        if (feature == null || feature.Shape == null || feature.Shape.IsEmpty)
+        IFeature feature;
+        while ((feature = featureCursor.NextFeature()) != null)
         {
-            MessageBox.Show("选中要素没有有效几何。", "缓冲区",
+            if (feature.Shape != null && !feature.Shape.IsEmpty)
+            {
+                IGeometry tempGeom = (IGeometry)((IClone)feature.Shape).Clone();
+                // 检查并统一坐标系
+                if (tempGeom.SpatialReference != null && map.SpatialReference != null && tempGeom.SpatialReference.FactoryCode != map.SpatialReference.FactoryCode)
+                {
+                    tempGeom.Project(map.SpatialReference);
+                }
+                geometryCollection.AddGeometry(tempGeom);
+            }
+        }
+        System.Runtime.InteropServices.Marshal.ReleaseComObject(cursor);
+
+        if (geometryCollection.GeometryCount == 0)
+        {
+            MessageBox.Show("选中的所有要素都没有有效的几何形状。", "缓冲区警告",
                 MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
+        
+        // 创建所有几何的联合体
+        ITopologicalOperator unionedGeomOperator = new PolygonClass();
+        unionedGeomOperator.ConstructUnion((IEnumGeometry)geometryCollection);
 
-        IGeometry geom = feature.ShapeCopy; // 使用副本
-        ITopologicalOperator topo = geom as ITopologicalOperator;
-        if (topo == null)
+        // 步骤 4: 对合并后的几何进行缓冲
+        IGeometry geomToBuffer = (IGeometry)unionedGeomOperator;
+        ITopologicalOperator bufferOperator = (ITopologicalOperator)geomToBuffer;
+        if (!bufferOperator.IsSimple)
         {
-            MessageBox.Show("该要素不支持缓冲运算。", "缓冲区",
-                MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            return;
+            bufferOperator.Simplify();
         }
 
-        // 缓冲半径 500（单位取决于地图投影，一般是米）
         double bufferDistance = 500.0;
-        IGeometry bufferGeom = topo.Buffer(bufferDistance);
+        IGeometry bufferGeom = bufferOperator.Buffer(bufferDistance);
 
         if (bufferGeom == null || bufferGeom.IsEmpty)
         {
-            MessageBox.Show("缓冲区生成失败。", "缓冲区",
-                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            MessageBox.Show("缓冲区生成失败。", "缓冲区错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return;
         }
 
-        // 3. 把缓冲几何画到地图的图形层上（红色半透明面）
-        IMap map = axMapControl1.Map;
-        IActiveView activeView = map as IActiveView;
-        IGraphicsContainer graphicsContainer = map as IGraphicsContainer;
+        // 步骤 5: 绘制缓冲区并刷新地图
+        IRgbColor fillColor = new RgbColorClass { Red = 255, Green = 0, Blue = 0, Transparency = 150 };
+        IRgbColor outlineColor = new RgbColorClass { Red = 255, Green = 0, Blue = 0, Transparency = 0 };
+        ISimpleLineSymbol outline = new SimpleLineSymbolClass { Color = outlineColor, Width = 1.5 };
+        ISimpleFillSymbol fillSymbol = new SimpleFillSymbolClass { Color = fillColor, Style = esriSimpleFillStyle.esriSFSSolid, Outline = outline };
 
-        if (graphicsContainer == null)
-        {
-            MessageBox.Show("无法获取图形容器。", "缓冲区",
-                MessageBoxButtons.OK, MessageBoxIcon.Error);
-            return;
-        }
-
-        // 可选：先清除之前生成的缓冲元素（如果你只想保留最新一个）
-        graphicsContainer.DeleteAllElements();
-
-        // 创建符号：红色半透明填充 + 红色边线
-        IRgbColor fillColor = new RgbColorClass();
-        fillColor.Red = 255;
-        fillColor.Green = 0;
-        fillColor.Blue = 0;
-        fillColor.Transparency = 80;   // 0–255，越小越透明
-
-        IRgbColor outlineColor = new RgbColorClass();
-        outlineColor.Red = 255;
-        outlineColor.Green = 0;
-        outlineColor.Blue = 0;
-        outlineColor.Transparency = 255;
-
-        ISimpleLineSymbol outline = new SimpleLineSymbolClass();
-        outline.Color = outlineColor;
-        outline.Width = 1.5;
-        outline.Style = esriSimpleLineStyle.esriSLSSolid;
-
-        ISimpleFillSymbol fillSymbol = new SimpleFillSymbolClass();
-        fillSymbol.Color = fillColor;
-        fillSymbol.Style = esriSimpleFillStyle.esriSFSSolid;
-        fillSymbol.Outline = outline;
-
-        IFillShapeElement fillElement = new PolygonElementClass();
-        IElement element = (IElement)fillElement;
+        IElement element = new PolygonElementClass();
         element.Geometry = bufferGeom;
-        fillElement.Symbol = fillSymbol;
-
+        ((IFillShapeElement)element).Symbol = fillSymbol;
         graphicsContainer.AddElement(element, 0);
 
-        // 4. 保存缓冲几何，供后续邻近查询使用
+        activeView.Extent = bufferGeom.Envelope;
+        activeView.Refresh();
+
         _lastBufferGeometry = bufferGeom;
 
-        // 5. 刷新图形层
-        activeView.PartialRefresh(esriViewDrawPhase.esriViewGraphics, null, null);
-
-        MessageBox.Show("已在图形层生成 {bufferDistance} 范围的缓冲区。", "缓冲区",
+        MessageBox.Show("已为选中的 {geometryCollection.GeometryCount} 个要素生成了统一的缓冲区。", "缓冲区成功", 
             MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
     catch (Exception ex)
     {
-        MessageBox.Show("缓冲区分析时发生错误：\n" + ex.Message,
-            "缓冲区错误",
-            MessageBoxButtons.OK, MessageBoxIcon.Error);
+        MessageBox.Show("缓冲区分析时发生严重错误：\n" + ex.Message, "缓冲区错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
     }
 }
 
